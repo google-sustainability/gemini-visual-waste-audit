@@ -7,7 +7,7 @@ google-genai
 google-cloud-bigquery==3.25.0
 google-cloud-firestore==2.17.1
 google-cloud-storage
-Pillow==10.4.0
+Pillow==12.3.0
 google-cloud-logging
 tenacity
 google-genai
