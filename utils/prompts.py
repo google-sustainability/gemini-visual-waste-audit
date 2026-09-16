@@ -351,7 +351,7 @@ DEFAULT_WASTE_AUDIT_GENERATION_CONFIG = genai_types.GenerateContentConfig(
 )
 
 PROMPTS_CONFIG: Dict[str, PromptConfig] = {
-    "v2.26-G3.7-flash": {
+    "v2.26-G3.8-flash": {
         "generation_config": genai_types.GenerateContentConfig(
             **DEFAULT_WASTE_AUDIT_GENERATION_CONFIG.model_dump(
                 exclude_none=True
@@ -364,7 +364,7 @@ PROMPTS_CONFIG: Dict[str, PromptConfig] = {
             ],
         ),
         "prompt_text": WASTE_AUDIT_USER_PROMPT,
-        "model_name": "gemini-3.7-flash",
+        "model_name": "gemini-3.8-flash",
     },
     "v2.26-G3.1-pro": {
         "generation_config": DEFAULT_WASTE_AUDIT_GENERATION_CONFIG,
