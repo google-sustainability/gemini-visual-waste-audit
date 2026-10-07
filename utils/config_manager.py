@@ -237,18 +237,13 @@ class ConfigManager:
 
       version_id = row["Version ID"]
       model_name = row["Model Name"]
-      temperature = row.get("Temperature")
       system_instruction_key = row["System Instruction Key"]
       user_prompt_key = row["User Prompt Key"]
-      thinking_level = row.get("Thinking Level", "HIGH")
+      raw_thinking_level = str(row.get("Thinking Level") or "").strip().upper()
+      thinking_level = raw_thinking_level if raw_thinking_level else "HIGH"
       enable_code_execution = (
           str(row.get("Enable Code Execution", "")).upper() == "TRUE"
       )
-
-      try:
-        temperature = float(temperature) if temperature is not None else 1.0
-      except ValueError:
-        temperature = 1.0
 
       if system_instruction_key not in general_config:
         logging.warning(
@@ -271,7 +266,6 @@ class ConfigManager:
 
       gen_config = genai_types.GenerateContentConfig(
           system_instruction=system_instruction,
-          temperature=temperature,
           safety_settings=[
               genai_types.SafetySetting(
                   category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"
@@ -289,7 +283,7 @@ class ConfigManager:
           tools=tools if tools else None,
           thinking_config=genai_types.ThinkingConfig(
               thinking_level=thinking_level
-          )
+          ),
       )
 
       prompts_config[version_id] = {

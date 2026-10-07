@@ -333,7 +333,6 @@ Please analyze the provided image according to the system instructions.
 
 DEFAULT_WASTE_AUDIT_GENERATION_CONFIG = genai_types.GenerateContentConfig(
     system_instruction=WASTE_AUDIT_SYSTEM_INSTRUCTION,
-    temperature=1.0,
     safety_settings=[
         genai_types.SafetySetting(
             category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"
@@ -357,10 +356,12 @@ PROMPTS_CONFIG: Dict[str, PromptConfig] = {
                 exclude_none=True
             ),
             thinking_config=genai_types.ThinkingConfig(
-                thinking_level="HIGH",
+                thinking_level=genai_types.ThinkingLevel.HIGH,
             ),
             tools=[
-                genai_types.Tool(code_execution=genai_types.ToolCodeExecution),
+                genai_types.Tool(
+                    code_execution=genai_types.ToolCodeExecution()
+                ),
             ],
         ),
         "prompt_text": WASTE_AUDIT_USER_PROMPT,
