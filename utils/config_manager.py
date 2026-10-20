@@ -209,25 +209,10 @@ class ConfigManager:
     \"\"\"
 {detected_fields}"""
 
-    system_instruction_template = general_config["system_instruction_template"]
-
-    required_placeholders = {
+    required_placeholders = (
         "{material_details}",
         "{material_densities_class}",
         "{detected_materials}",
-    }
-    for placeholder in required_placeholders:
-      if placeholder not in system_instruction_template:
-        logging.error(
-            "Missing placeholder %s in system_instruction_template",
-            placeholder,
-        )
-        return None
-
-    system_instruction = system_instruction_template.format(
-        material_details=material_details_json,
-        material_densities_class=material_densities_class_str,
-        detected_materials=detected_materials_str,
     )
 
     prompts_config = {}
@@ -257,6 +242,29 @@ class ConfigManager:
             user_prompt_key,
         )
         continue
+
+      system_instruction_template = general_config[system_instruction_key]
+      missing_placeholder = next(
+          (
+              placeholder
+              for placeholder in required_placeholders
+              if placeholder not in system_instruction_template
+          ),
+          None,
+      )
+      if missing_placeholder:
+        logging.error(
+            "Missing placeholder %s in %s",
+            missing_placeholder,
+            system_instruction_key,
+        )
+        continue
+
+      system_instruction = system_instruction_template.format(
+          material_details=material_details_json,
+          material_densities_class=material_densities_class_str,
+          detected_materials=detected_materials_str,
+      )
 
       tools = []
       if enable_code_execution:
