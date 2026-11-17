@@ -5,7 +5,9 @@ google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.0
 google-genai
 google-cloud-bigquery==3.25.0
+google-cloud-bigquery-storage>=2.26.0
 google-cloud-firestore==2.17.1
+protobuf>=4.21.0
 google-cloud-storage
 Pillow>=13.0.0
 google-cloud-logging
