@@ -19,12 +19,21 @@ The pipeline consists of two main services: the **Ingestion Service** and the
     .png) is uploaded to a designated **Google Cloud Storage (GCS)** bucket.
 2.  **Event Notification**: An **Eventarc** trigger detects the new GCS object
     and sends a CloudEvent payload to the **Ingestion Service**.
-3.  **Ingestion**: The Ingestion Service receives the GCS object details. For
-    each prompt version defined in `utils/prompts.py`, it checks **Firestore**
-    to see if the image has already been processed for that prompt.
-4.  **Deduplication & Dispatch**: If a job for that image and prompt version is
-    new or has failed, it creates an authenticated task in **Cloud Tasks** and
-    marks the job as `QUEUED` in Firestore.
+3.  **Ingestion & Generation Reconciliation**: The Ingestion Service (`/ingest`)
+    validates incoming GCS metadata (`bucket`, `name`, and optional
+    `generation`) and fans out across configured prompt versions (loaded from
+    Google Sheets when configured, or falling back to `utils/prompts.py`).
+    Duplicate or older object generations are skipped idempotently; if a newer
+    generation arrives while a prior job is still in flight, `/ingest` returns
+    `503` so Eventarc retries once the active worker settles.
+4.  **Overwrite Cleanup & Dispatch**: For new uploads, settled retries, or
+    settled overwrites, `/ingest` atomically claims the
+    `(gcs_uri, prompt_version_id)` job record as `QUEUED` in **Firestore** using
+    `last_update_time` preconditions. On settled overwrites, it hard-deletes
+    superseded **BigQuery** rows for that
+    `(gcs_uri, prompt_version_id)`—preserving rows from other prompt
+    versions—before creating an authenticated task in **Cloud Tasks** (rolling
+    back the Firestore claim if BigQuery cleanup or task dispatch fails).
 5.  **Processing**: The **Processing Service** picks up tasks from the Cloud
     Tasks queue. It updates the Firestore job status to `PROCESSING`.
 6.  **Image Retrieval**: The service downloads the image file from GCS using the
@@ -34,11 +43,11 @@ The pipeline consists of two main services: the **Ingestion Service** and the
 8.  **Storage**: If analysis is successful, the flattened JSON result from
     Gemini is written to a **BigQuery** table for results, and the Firestore job
     status is updated to `PROCESSED`. If analysis fails, the error is logged to
-    a separate BigQuery table for errors, and the status is updated to `FAILED`
-    in Firestore.
+    a separate BigQuery table for errors, and the status is updated to
+    `FAILED_RETRY` or `FAILED_PERMANENT` in Firestore.
 9.  **State Tracking**: **Firestore** is used throughout the process to track
-    the state of each image-prompt job (e.g., `QUEUED`, `PROCESSING`,
-    `PROCESSED`, `FAILED`).
+    the state of each `(gcs_uri, prompt_version_id)` job (`QUEUED`,
+    `PROCESSING`, `PROCESSED`, `FAILED_RETRY`, `FAILED_PERMANENT`).
 
 ## Directory Structure
 

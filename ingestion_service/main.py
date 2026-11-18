@@ -12,23 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cloud Run service to ingest and dispatch image processing tasks.
+"""Cloud Run service to ingest and reconcile image processing tasks.
 
-This service is triggered by Eventarc (GCS Object Finalized) events.
-
-**Workflow:**
-1.  Receives a CloudEvent via HTTP POST at `/ingest`.
-2.  Extracts and validates the GCS bucket and object name.
-3.  Iterates through all configured prompt versions.
-4.  Creates a unique task for each version in a Google Cloud Tasks queue,
-    targeting the processing service.
-5.  Creates/Updates a document in Firestore to mark the job as `QUEUED`.
+Handles Eventarc GCS Object Finalized (`/ingest`) CloudEvents.
 """
 
 import dataclasses
 import datetime
-import enum
-import hashlib
 import http
 import json
 import logging
@@ -36,11 +26,14 @@ import os
 import sys
 from typing import Any
 
+import bigquery_reconciler
 import flask
 from google.api_core import exceptions as google_exceptions
 from google.auth import exceptions as auth_exceptions
+from google.cloud import bigquery
 from google.cloud import firestore
 from google.cloud import tasks_v2
+import job_store
 
 
 
@@ -66,22 +59,10 @@ FIRESTORE_COLLECTION = os.environ.get(
 )
 INGESTION_SA_EMAIL = os.environ.get("INGESTION_SA_EMAIL")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
-
-
-class _JobStatus(enum.StrEnum):
-  """Firestore lifecycle states for an image audit job."""
-
-  QUEUED = "QUEUED"
-  PROCESSING = "PROCESSING"
-  PROCESSED = "PROCESSED"
-
+BIGQUERY_DATASET = os.environ.get("BIGQUERY_DATASET")
+BIGQUERY_TABLE = os.environ.get("BIGQUERY_TABLE")
 
 _SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
-_ACTIVE_JOB_STATUSES = frozenset({
-    _JobStatus.QUEUED,
-    _JobStatus.PROCESSING,
-    _JobStatus.PROCESSED,
-})
 
 app = flask.Flask(__name__)
 
@@ -90,6 +71,7 @@ setup_logging()
 _LOGGER = logging.getLogger(__name__)
 _FIRESTORE_CLIENT: firestore.Client | None = None
 _TASKS_CLIENT: tasks_v2.CloudTasksClient | None = None
+_BQ_CLIENT: bigquery.Client | None = None
 _TASK_QUEUE_PATH: str | None = None
 _CONFIG_MANAGER = ConfigManager(SPREADSHEET_ID) if SPREADSHEET_ID else None
 
@@ -101,10 +83,12 @@ class _GcsEvent:
   Attributes:
     bucket: GCS bucket name containing the object.
     name: GCS object path within the bucket.
+    generation: Optional positive integer GCS object generation number.
   """
 
   bucket: str
   name: str
+  generation: int | None = None
 
   @property
   def gcs_uri(self) -> str:
@@ -126,6 +110,14 @@ def _get_tasks_client() -> tasks_v2.CloudTasksClient:
   if _TASKS_CLIENT is None:
     _TASKS_CLIENT = tasks_v2.CloudTasksClient()
   return _TASKS_CLIENT
+
+
+def _get_bq_client() -> bigquery.Client:
+  """Lazy initializes and returns the BigQuery client."""
+  global _BQ_CLIENT
+  if _BQ_CLIENT is None:
+    _BQ_CLIENT = bigquery.Client(project=GCP_PROJECT_ID)
+  return _BQ_CLIENT
 
 
 def _get_task_queue_path() -> str:
@@ -157,22 +149,40 @@ def _parse_gcs_event(event_data: Any) -> _GcsEvent | None:
     event_data: Decoded JSON body from the HTTP request.
 
   Returns:
-    A validated `_GcsEvent`, or `None` if `event_data` is not a dict with
-    non-blank string `bucket` (containing no `/`) and `name` fields.
+    A validated `_GcsEvent`, or `None` if `event_data` is not a dict with a
+    valid GCS `bucket` (alphanumeric boundaries, no `/` or whitespace),
+    non-blank `name`, and optional positive integer `generation`.
   """
   if not isinstance(event_data, dict):
     return None
   bucket = event_data.get("bucket")
   name = event_data.get("name")
-  if (
-      not isinstance(bucket, str)
-      or not isinstance(name, str)
-      or not bucket.strip()
-      or "/" in bucket
-      or not name.strip()
-  ):
+  is_valid_bucket = (
+      isinstance(bucket, str)
+      and bool(bucket)
+      and not any(ch.isspace() for ch in bucket)
+      and "/" not in bucket
+      and bucket[0].isalnum()
+      and bucket[-1].isalnum()
+  )
+  is_valid_object_target = (
+      is_valid_bucket and isinstance(name, str) and bool(name.strip())
+  )
+  if not is_valid_object_target:
     return None
-  return _GcsEvent(bucket=bucket, name=name)
+
+  raw_generation = event_data.get("generation")
+  is_unset_generation = raw_generation is None or (
+      isinstance(raw_generation, str) and not raw_generation.strip()
+  )
+  if is_unset_generation:
+    generation = None
+  else:
+    generation = job_store.parse_generation(raw_generation)
+    if generation is None:
+      return None
+
+  return _GcsEvent(bucket=bucket, name=name, generation=generation)
 
 
 def _is_supported_image(object_name: str) -> bool:
@@ -227,61 +237,124 @@ def _get_prompt_versions() -> list[str]:
 
 def _enqueue_prompt_version_job(
     *,
+    firestore_client: firestore.Client,
     jobs_collection: firestore.CollectionReference,
     tasks_client: tasks_v2.CloudTasksClient,
     task_queue_path: str,
     event: _GcsEvent,
     prompt_version_id: str,
-) -> bool:
-  """Checks idempotency and enqueues a prompt version job if needed.
+) -> job_store.EnqueueOutcome:
+  """Reconciles state and enqueues a prompt version job if needed.
 
   Args:
+    firestore_client: Firestore client used to build write preconditions.
     jobs_collection: Firestore collection tracking ingestion jobs.
     tasks_client: Cloud Tasks client used to dispatch processing tasks.
     task_queue_path: Fully qualified Cloud Tasks queue resource path.
     event: Validated GCS object event metadata.
-    prompt_version_id: Prompt version key to enqueue.
+    prompt_version_id: Prompt version key to reconcile and enqueue.
 
   Returns:
-    `True` if a new Cloud Task and Firestore record were created; `False` if
-    an active or completed job already exists for this image and prompt
-    version.
+    `EnqueueOutcome.QUEUED` when a Cloud Task and Firestore record were created,
+    `EnqueueOutcome.SKIPPED` when an active or newer job already covers the
+    event, or `EnqueueOutcome.DEFERRED_IN_FLIGHT` when a prior generation is
+    still executing.
 
   Raises:
     RuntimeError: If task creation configuration is missing.
-    auth_exceptions.GoogleAuthError: If Firestore or Cloud Tasks authentication
+    ValueError: If BigQuery table configuration identifiers are invalid.
+    auth_exceptions.GoogleAuthError: If Firestore, BigQuery, or Cloud Tasks
+      authentication fails.
+    google_exceptions.GoogleAPIError: If Firestore, BigQuery, or Cloud Tasks
       fails.
-    google_exceptions.GoogleAPICallError: If Firestore or Cloud Tasks fails.
   """
-  composite_key_raw = f"{event.gcs_uri}:{prompt_version_id}"
-  composite_key = hashlib.sha256(composite_key_raw.encode()).hexdigest()
-  doc_ref = jobs_collection.document(composite_key)
+  doc_id = job_store.make_job_doc_id(event.gcs_uri, prompt_version_id)
+  doc_ref = jobs_collection.document(doc_id)
 
   doc_snapshot = doc_ref.get()
+  decision = job_store.ReconcileDecision(
+      outcome=job_store.EnqueueOutcome.QUEUED
+  )
   if doc_snapshot.exists:
-    job_data = doc_snapshot.to_dict() or {}
-    status = job_data.get("status")
-    if status in _ACTIVE_JOB_STATUSES:
+    existing_job_data = doc_snapshot.to_dict() or {}
+    decision = job_store.reconcile_existing_job(
+        existing_job_data, event_generation=event.generation
+    )
+    if decision.outcome == job_store.EnqueueOutcome.SKIPPED:
       _LOGGER.info(
-          "Job for %s (%s) already in status %s; skipping.",
+          "Skipping %s (%s) at generation=%s (stored_status=%s,"
+          " stored_generation=%s).",
           event.gcs_uri,
           prompt_version_id,
-          status,
+          event.generation,
+          existing_job_data.get("status"),
+          existing_job_data.get("generation"),
       )
-      return False
+      return job_store.EnqueueOutcome.SKIPPED
+    if decision.outcome == job_store.EnqueueOutcome.DEFERRED_IN_FLIGHT:
+      _LOGGER.info(
+          "Deferring %s (%s) at generation=%s while prior generation=%s is %s.",
+          event.gcs_uri,
+          prompt_version_id,
+          event.generation,
+          existing_job_data.get("generation"),
+          existing_job_data.get("status"),
+      )
+      return job_store.EnqueueOutcome.DEFERRED_IN_FLIGHT
 
   task = _create_task(
       gcs_uri=event.gcs_uri, prompt_version_id=prompt_version_id
   )
-  tasks_client.create_task(parent=task_queue_path, task=task)
-  doc_ref.set({
+  table_id = None
+  if decision.delete_superseded_rows:
+    table_id = bigquery_reconciler.resolve_table_id(
+        project_id=GCP_PROJECT_ID,
+        dataset_id=BIGQUERY_DATASET,
+        table_id=BIGQUERY_TABLE,
+    )
+
+  job_document: dict[str, Any] = {
       "gcs_uri": event.gcs_uri,
       "prompt_version_id": prompt_version_id,
-      "status": _JobStatus.QUEUED,
+      "status": job_store.JobStatus.QUEUED,
       "queued_at": datetime.datetime.now(datetime.timezone.utc),
-  })
+  }
+  if event.generation is not None:
+    job_document["generation"] = event.generation
+
+  claimed_job = job_store.claim_queued_job(
+      firestore_client=firestore_client,
+      doc_ref=doc_ref,
+      doc_snapshot=doc_snapshot,
+      job_document=job_document,
+  )
+  bq_rows_deleted = False
+  try:
+    if table_id is not None:
+      deleted_rows = bigquery_reconciler.delete_rows(
+          _get_bq_client(),
+          table_id=table_id,
+          gcs_uri=event.gcs_uri,
+          prompt_version_id=prompt_version_id,
+      )
+      bq_rows_deleted = True
+      _LOGGER.info(
+          "Deleted %d superseded BigQuery rows for %s (%s).",
+          deleted_rows,
+          event.gcs_uri,
+          prompt_version_id,
+      )
+    tasks_client.create_task(parent=task_queue_path, task=task)
+  except Exception:
+    job_store.rollback_claimed_job(
+        firestore_client=firestore_client,
+        claimed_job=claimed_job,
+        bq_rows_deleted=bq_rows_deleted,
+    )
+    raise
+
   _LOGGER.info("Created task for %s (%s).", event.gcs_uri, prompt_version_id)
-  return True
+  return job_store.EnqueueOutcome.QUEUED
 
 
 @app.route("/", methods=["GET"])
@@ -309,13 +382,14 @@ def ingest_event() -> tuple[str | flask.Response, http.HTTPStatus]:
 
   _LOGGER.info("Ingesting file: %s", event.gcs_uri)
   try:
-    jobs_collection = _get_firestore_client().collection(FIRESTORE_COLLECTION)
+    firestore_client = _get_firestore_client()
+    jobs_collection = firestore_client.collection(FIRESTORE_COLLECTION)
     tasks_client = _get_tasks_client()
     task_queue_path = _get_task_queue_path()
     prompt_versions = _get_prompt_versions()
   except (
       auth_exceptions.GoogleAuthError,
-      google_exceptions.GoogleAPICallError,
+      google_exceptions.GoogleAPIError,
       RuntimeError,
   ):
     _LOGGER.exception(
@@ -324,10 +398,12 @@ def ingest_event() -> tuple[str | flask.Response, http.HTTPStatus]:
     return "Internal Server Error", http.HTTPStatus.INTERNAL_SERVER_ERROR
 
   tasks_created_count = 0
+  deferred_versions: list[str] = []
   failed_versions: list[str] = []
   for prompt_version_id in prompt_versions:
     try:
-      queued = _enqueue_prompt_version_job(
+      outcome = _enqueue_prompt_version_job(
+          firestore_client=firestore_client,
           jobs_collection=jobs_collection,
           tasks_client=tasks_client,
           task_queue_path=task_queue_path,
@@ -336,18 +412,21 @@ def ingest_event() -> tuple[str | flask.Response, http.HTTPStatus]:
       )
     except (
         auth_exceptions.GoogleAuthError,
-        google_exceptions.GoogleAPICallError,
+        google_exceptions.GoogleAPIError,
         RuntimeError,
+        ValueError,
     ):
       _LOGGER.exception(
-          "Error creating task or Firestore doc for %s (%s)",
+          "Error reconciling or creating task for %s (%s)",
           event.gcs_uri,
           prompt_version_id,
       )
       failed_versions.append(prompt_version_id)
     else:
-      if queued:
+      if outcome == job_store.EnqueueOutcome.QUEUED:
         tasks_created_count += 1
+      elif outcome == job_store.EnqueueOutcome.DEFERRED_IN_FLIGHT:
+        deferred_versions.append(prompt_version_id)
 
   if failed_versions:
     return (
@@ -357,6 +436,16 @@ def ingest_event() -> tuple[str | flask.Response, http.HTTPStatus]:
             "failed_versions": failed_versions,
         }),
         http.HTTPStatus.INTERNAL_SERVER_ERROR,
+    )
+
+  if deferred_versions:
+    return (
+        flask.jsonify({
+            "status": "deferred",
+            "tasks_created": tasks_created_count,
+            "deferred_versions": deferred_versions,
+        }),
+        http.HTTPStatus.SERVICE_UNAVAILABLE,
     )
 
   _LOGGER.info("Ingestion complete. Created %d new tasks.", tasks_created_count)
