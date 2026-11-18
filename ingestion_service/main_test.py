@@ -443,6 +443,7 @@ class IngestionMainTest(parameterized.TestCase):
             "queued_at": mock.ANY,
             "generation": 200,
             "attempts": firestore.DELETE_FIELD,
+            "deleting_at": firestore.DELETE_FIELD,
             "error_message": firestore.DELETE_FIELD,
             "last_processed_at": firestore.DELETE_FIELD,
         },

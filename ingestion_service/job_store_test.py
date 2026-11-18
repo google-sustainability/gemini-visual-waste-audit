@@ -34,6 +34,14 @@ _SNAPSHOT_UPDATE_TIME = datetime.datetime(
 _CLAIM_UPDATE_TIME = datetime.datetime(
     2026, 11, 5, 12, 1, tzinfo=datetime.timezone.utc
 )
+_SNAPSHOT_SPEC = firestore.DocumentSnapshot(
+    reference=None,
+    data={},
+    exists=False,
+    read_time=None,
+    create_time=None,
+    update_time=_SNAPSHOT_UPDATE_TIME,
+)
 
 
 def _make_snapshot_mock(
@@ -43,15 +51,7 @@ def _make_snapshot_mock(
     data: Mapping[str, Any] | None = None,
     update_time: datetime.datetime | None = _SNAPSHOT_UPDATE_TIME,
 ) -> mock.MagicMock:
-  snapshot_spec = firestore.DocumentSnapshot(
-      reference=doc_ref,
-      data={},
-      exists=False,
-      read_time=None,
-      create_time=None,
-      update_time=_SNAPSHOT_UPDATE_TIME,
-  )
-  snapshot_mock = mock.create_autospec(snapshot_spec, spec_set=True)
+  snapshot_mock = mock.create_autospec(_SNAPSHOT_SPEC, spec_set=True)
   snapshot_mock.reference = doc_ref
   snapshot_mock.exists = exists
   snapshot_mock.update_time = update_time
@@ -70,10 +70,15 @@ class JobStoreTest(parameterized.TestCase):
         firestore.DocumentReference, instance=True, spec_set=True
     )
     self.mock_doc_ref.id = "doc-123"
+    self.mock_batch = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
     self.write_result = firestore.types.WriteResult(
         update_time=_CLAIM_UPDATE_TIME
     )
     self.mock_firestore.write_option.side_effect = firestore.Client.write_option
+    self.mock_firestore.batch.return_value = self.mock_batch
+    self.mock_batch.commit.return_value = [self.write_result]
     self.mock_doc_ref.create.return_value = self.write_result
     self.mock_doc_ref.update.return_value = self.write_result
 
@@ -163,6 +168,11 @@ class JobStoreTest(parameterized.TestCase):
           event_generation=100,
       ),
       dict(
+          testcase_name="duplicate_gen_deleting_without_timestamp",
+          job_data={"status": "DELETING", "generation": 100},
+          event_generation=100,
+      ),
+      dict(
           testcase_name="duplicate_gen_failed_retry_backoff",
           job_data={
               "status": "FAILED_RETRY",
@@ -179,6 +189,15 @@ class JobStoreTest(parameterized.TestCase):
               "generation": 100,
               "attempts": 2,
               "last_processed_at": _NOW - datetime.timedelta(minutes=5),
+          },
+          event_generation=100,
+      ),
+      dict(
+          testcase_name="duplicate_gen_active_deleting_claim",
+          job_data={
+              "status": "DELETING",
+              "generation": 100,
+              "deleting_at": _NOW - datetime.timedelta(minutes=5),
           },
           event_generation=100,
       ),
@@ -208,6 +227,7 @@ class JobStoreTest(parameterized.TestCase):
               "generation": 100,
               "queued_at": _NOW - datetime.timedelta(hours=2),
           },
+          event_generation=200,
       ),
       dict(
           testcase_name="processing_at_exact_2h_boundary",
@@ -216,6 +236,7 @@ class JobStoreTest(parameterized.TestCase):
               "generation": 100,
               "last_processed_at": _NOW - datetime.timedelta(hours=2),
           },
+          event_generation=200,
       ),
       dict(
           testcase_name="failed_retry_at_exact_10m_boundary",
@@ -225,6 +246,7 @@ class JobStoreTest(parameterized.TestCase):
               "attempts": 4,
               "last_processed_at": _NOW - datetime.timedelta(minutes=10),
           },
+          event_generation=200,
       ),
       dict(
           testcase_name="failed_permanent_backoff_naive_utc",
@@ -234,14 +256,34 @@ class JobStoreTest(parameterized.TestCase):
               "attempts": 1,
               "last_processed_at": _NAIVE_RECENT_UTC,
           },
+          event_generation=200,
+      ),
+      dict(
+          testcase_name="deleting_claim_at_exact_10m_boundary_newer_gen",
+          job_data={
+              "status": "DELETING",
+              "generation": 100,
+              "deleting_at": _NOW - datetime.timedelta(minutes=10),
+          },
+          event_generation=200,
+      ),
+      dict(
+          testcase_name="deleting_claim_omitted_gen",
+          job_data={
+              "status": "DELETING",
+              "generation": 100,
+              "deleting_at": _NOW - datetime.timedelta(minutes=5),
+          },
+          event_generation=None,
       ),
   )
-  def test_reconcile_existing_job_defers_newer_generation_while_in_flight(
+  def test_reconcile_existing_job_defers_while_in_flight_or_deleting(
       self,
       job_data: Mapping[str, Any],
+      event_generation: int | None,
   ):
     decision = job_store.reconcile_existing_job(
-        job_data, event_generation=200, now=_NOW
+        job_data, event_generation=event_generation, now=_NOW
     )
 
     self.assertEqual(
@@ -391,6 +433,16 @@ class JobStoreTest(parameterized.TestCase):
               ),
           },
       ),
+      dict(
+          testcase_name="expired_deleting_claim_over_10m",
+          job_data={
+              "status": "DELETING",
+              "generation": 100,
+              "deleting_at": (
+                  _NOW - datetime.timedelta(minutes=10, microseconds=1)
+              ),
+          },
+      ),
   )
   def test_reconcile_existing_job_queues_overwrite_with_bq_delete(
       self, job_data: Mapping[str, Any]
@@ -404,6 +456,159 @@ class JobStoreTest(parameterized.TestCase):
         job_store.ReconcileDecision(
             outcome=job_store.EnqueueOutcome.QUEUED,
             delete_superseded_rows=True,
+        ),
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="matching_generation", event_generation=100),
+      dict(testcase_name="newer_delete_generation", event_generation=200),
+      dict(testcase_name="omitted_generation", event_generation=None),
+  )
+  def test_classify_delete_snapshots_returns_settled_targets(
+      self, event_generation: int | None
+  ):
+    settled_processed = _make_snapshot_mock(
+        self.mock_doc_ref,
+        exists=True,
+        data={"status": "PROCESSED", "generation": 100},
+    )
+    expired_deleting = _make_snapshot_mock(
+        self.mock_doc_ref,
+        exists=True,
+        data={
+            "status": "DELETING",
+            "generation": 100,
+            "deleting_at": (
+                _NOW - datetime.timedelta(minutes=10, microseconds=1)
+            ),
+        },
+    )
+
+    plan = job_store.classify_delete_snapshots(
+        doc_snapshots=[settled_processed, expired_deleting],
+        event_generation=event_generation,
+        now=_NOW,
+    )
+
+    self.assertEqual(
+        plan,
+        job_store.DeletePlan(
+            action=job_store.DeleteAction.DELETE,
+            target_docs=(settled_processed, expired_deleting),
+        ),
+    )
+
+  def test_classify_delete_snapshots_prioritizes_newer_generation_skip(self):
+    in_flight_older = _make_snapshot_mock(
+        self.mock_doc_ref,
+        exists=True,
+        data={"status": "PROCESSING", "generation": 100},
+    )
+    newer_settled = _make_snapshot_mock(
+        self.mock_doc_ref,
+        exists=True,
+        data={"status": "PROCESSED", "generation": 200},
+    )
+
+    plan = job_store.classify_delete_snapshots(
+        doc_snapshots=[in_flight_older, newer_settled],
+        event_generation=100,
+        now=_NOW,
+    )
+
+    self.assertEqual(
+        plan,
+        job_store.DeletePlan(
+            action=job_store.DeleteAction.SKIP_STALE_GENERATION
+        ),
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="queued",
+          active_data={
+              "status": "QUEUED",
+              "generation": 100,
+              "queued_at": _NOW - datetime.timedelta(hours=2),
+          },
+      ),
+      dict(
+          testcase_name="processing",
+          active_data={
+              "status": "PROCESSING",
+              "generation": 100,
+              "last_processed_at": _NOW - datetime.timedelta(hours=2),
+          },
+      ),
+      dict(
+          testcase_name="failed_retry",
+          active_data={
+              "status": "FAILED_RETRY",
+              "generation": 100,
+              "attempts": 2,
+              "last_processed_at": _NOW - datetime.timedelta(minutes=10),
+          },
+      ),
+      dict(
+          testcase_name="failed_permanent",
+          active_data={
+              "status": "FAILED_PERMANENT",
+              "generation": 100,
+              "attempts": 2,
+              "last_processed_at": _NOW - datetime.timedelta(minutes=10),
+          },
+      ),
+      dict(
+          testcase_name="deleting",
+          active_data={
+              "status": "DELETING",
+              "generation": 100,
+              "deleting_at": _NOW - datetime.timedelta(minutes=10),
+          },
+      ),
+  )
+  def test_classify_delete_snapshots_defers_when_any_job_is_active_or_claimed(
+      self, active_data: Mapping[str, Any]
+  ):
+    settled_doc = _make_snapshot_mock(
+        self.mock_doc_ref,
+        exists=True,
+        data={"status": "PROCESSED", "generation": 100},
+    )
+    active_doc = _make_snapshot_mock(
+        self.mock_doc_ref, exists=True, data=active_data
+    )
+
+    plan = job_store.classify_delete_snapshots(
+        doc_snapshots=[settled_doc, active_doc],
+        event_generation=100,
+        now=_NOW,
+    )
+
+    self.assertEqual(
+        plan,
+        job_store.DeletePlan(action=job_store.DeleteAction.DEFER_IN_FLIGHT),
+    )
+
+  def test_classify_delete_snapshots_ignores_non_existent_snapshots(self):
+    missing_doc = _make_snapshot_mock(self.mock_doc_ref, exists=False)
+    settled_doc = _make_snapshot_mock(
+        self.mock_doc_ref,
+        exists=True,
+        data={"status": "PROCESSED", "generation": 100},
+    )
+
+    plan = job_store.classify_delete_snapshots(
+        doc_snapshots=[missing_doc, settled_doc],
+        event_generation=100,
+        now=_NOW,
+    )
+
+    self.assertEqual(
+        plan,
+        job_store.DeletePlan(
+            action=job_store.DeleteAction.DELETE,
+            target_docs=(settled_doc,),
         ),
     )
 
@@ -466,6 +671,7 @@ class JobStoreTest(parameterized.TestCase):
             "status": job_store.JobStatus.QUEUED,
             "generation": 200,
             "attempts": firestore.DELETE_FIELD,
+            "deleting_at": firestore.DELETE_FIELD,
             "error_message": firestore.DELETE_FIELD,
             "last_processed_at": firestore.DELETE_FIELD,
         },
@@ -500,6 +706,7 @@ class JobStoreTest(parameterized.TestCase):
         "status": job_store.JobStatus.QUEUED,
         "generation": firestore.DELETE_FIELD,
         "attempts": firestore.DELETE_FIELD,
+        "deleting_at": firestore.DELETE_FIELD,
         "error_message": firestore.DELETE_FIELD,
         "last_processed_at": firestore.DELETE_FIELD,
     })
@@ -620,6 +827,260 @@ class JobStoreTest(parameterized.TestCase):
       job_store.rollback_claimed_job(
           firestore_client=self.mock_firestore,
           claimed_job=claimed_job,
+          bq_rows_deleted=False,
+      )
+
+  def test_claim_deleting_docs_chunks_at_500_firestore_limit(self):
+    batch_chunk_1 = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
+    batch_chunk_2 = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
+    batch_chunk_1.commit.return_value = [self.write_result] * 500
+    batch_chunk_2.commit.return_value = []
+    self.mock_firestore.batch.side_effect = [batch_chunk_1, batch_chunk_2]
+    snapshots = [
+        _make_snapshot_mock(
+            self.mock_doc_ref,
+            exists=True,
+            data={"status": "PROCESSED"},
+            update_time=_SNAPSHOT_UPDATE_TIME if index < 500 else None,
+        )
+        for index in range(501)
+    ]
+
+    claimed = job_store.claim_deleting_docs(
+        firestore_client=self.mock_firestore,
+        target_docs=snapshots,
+        now=_NOW,
+    )
+
+    self.assertLen(claimed, 501)
+    self.assertEqual(claimed[0].claim_update_time, _CLAIM_UPDATE_TIME)
+    self.assertIsNone(claimed[500].claim_update_time)
+    self.assertEqual(batch_chunk_1.update.call_count, 500)
+    self.assertEqual(batch_chunk_2.update.call_count, 1)
+    batch_chunk_2.update.assert_called_once_with(
+        self.mock_doc_ref,
+        {"status": job_store.JobStatus.DELETING, "deleting_at": _NOW},
+    )
+
+  def test_commit_deleted_docs_chunks_at_500_firestore_limit(self):
+    batch_chunk_1 = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
+    batch_chunk_2 = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
+    batch_chunk_1.commit.return_value = []
+    batch_chunk_2.commit.return_value = []
+    self.mock_firestore.batch.side_effect = [batch_chunk_1, batch_chunk_2]
+    claimed_docs = [
+        job_store.ClaimedDeleteDoc(
+            reference=self.mock_doc_ref,
+            previous_data={"status": "PROCESSED"},
+            claim_update_time=_CLAIM_UPDATE_TIME if index < 500 else None,
+        )
+        for index in range(501)
+    ]
+
+    job_store.commit_deleted_docs(
+        firestore_client=self.mock_firestore,
+        claimed_docs=claimed_docs,
+    )
+
+    self.assertEqual(batch_chunk_1.delete.call_count, 500)
+    self.assertEqual(batch_chunk_2.delete.call_count, 1)
+    batch_chunk_2.delete.assert_called_once_with(self.mock_doc_ref)
+
+  def test_commit_deleted_docs_rolls_back_only_undeleted_tail_when_chunk_fails(
+      self,
+  ):
+    doc_ref_deleted = mock.create_autospec(
+        firestore.DocumentReference, instance=True, spec_set=True
+    )
+    doc_ref_surviving = mock.create_autospec(
+        firestore.DocumentReference, instance=True, spec_set=True
+    )
+    batch_delete_1 = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
+    batch_delete_2 = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
+    batch_rollback = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
+    batch_delete_1.commit.return_value = []
+    batch_delete_2.commit.side_effect = google_exceptions.ServiceUnavailable(
+        "Second delete chunk failed"
+    )
+    batch_rollback.commit.return_value = []
+    self.mock_firestore.batch.side_effect = [
+        batch_delete_1,
+        batch_delete_2,
+        batch_rollback,
+    ]
+    claimed_docs = [
+        job_store.ClaimedDeleteDoc(
+            reference=doc_ref_deleted,
+            previous_data={"status": "PROCESSED"},
+            claim_update_time=_CLAIM_UPDATE_TIME,
+        )
+        for _ in range(500)
+    ] + [
+        job_store.ClaimedDeleteDoc(
+            reference=doc_ref_surviving,
+            previous_data={"status": "PROCESSED"},
+            claim_update_time=_CLAIM_UPDATE_TIME,
+        )
+    ]
+
+    with self.assertRaisesRegex(
+        google_exceptions.ServiceUnavailable, "Second delete chunk failed"
+    ):
+      job_store.commit_deleted_docs(
+          firestore_client=self.mock_firestore,
+          claimed_docs=claimed_docs,
+      )
+
+    batch_rollback.update.assert_called_once_with(
+        doc_ref_surviving,
+        {
+            "status": job_store.JobStatus.FAILED_RETRY,
+            "attempts": 5,
+            "deleting_at": firestore.DELETE_FIELD,
+        },
+        option=firestore.Client.write_option(
+            last_update_time=_CLAIM_UPDATE_TIME
+        ),
+    )
+    batch_rollback.commit.assert_called_once_with()
+
+  def test_claim_deleting_docs_rolls_back_committed_chunk_when_next_chunk_fails(
+      self,
+  ):
+    snapshots = [
+        _make_snapshot_mock(
+            self.mock_doc_ref,
+            exists=True,
+            data={"status": "PROCESSED"},
+        )
+        for _ in range(501)
+    ]
+    self.mock_batch.commit.side_effect = [
+        [self.write_result] * 500,
+        google_exceptions.FailedPrecondition("Second chunk conflict"),
+        [],
+    ]
+
+    with self.assertRaisesRegex(
+        google_exceptions.FailedPrecondition, "Second chunk conflict"
+    ):
+      job_store.claim_deleting_docs(
+          firestore_client=self.mock_firestore,
+          target_docs=snapshots,
+          now=_NOW,
+      )
+
+    self.assertEqual(self.mock_batch.commit.call_count, 3)
+    self.assertEqual(
+        self.mock_batch.update.call_args_list[-1],
+        mock.call(
+            self.mock_doc_ref,
+            {"status": "PROCESSED", "deleting_at": firestore.DELETE_FIELD},
+            option=firestore.Client.write_option(
+                last_update_time=_CLAIM_UPDATE_TIME
+            ),
+        ),
+    )
+
+  def test_rollback_deleting_docs_marks_failed_retry_after_bq_delete(self):
+    claimed_doc = job_store.ClaimedDeleteDoc(
+        reference=self.mock_doc_ref,
+        previous_data={"status": "PROCESSED"},
+        claim_update_time=None,
+    )
+
+    job_store.rollback_deleting_docs(
+        firestore_client=self.mock_firestore,
+        claimed_docs=[claimed_doc],
+        bq_rows_deleted=True,
+    )
+
+    self.mock_batch.update.assert_called_once_with(
+        self.mock_doc_ref,
+        {
+            "status": job_store.JobStatus.FAILED_RETRY,
+            "attempts": 5,
+            "deleting_at": firestore.DELETE_FIELD,
+        },
+    )
+    self.mock_batch.commit.assert_called_once_with()
+
+  def test_rollback_deleting_docs_isolates_batch_failures_across_chunks(self):
+    batch_chunk_1 = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
+    batch_chunk_2 = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
+    batch_chunk_1.commit.side_effect = google_exceptions.FailedPrecondition(
+        "Chunk 1 precondition failed"
+    )
+    batch_chunk_2.commit.return_value = []
+    self.mock_firestore.batch.side_effect = [batch_chunk_1, batch_chunk_2]
+    claimed_docs = [
+        job_store.ClaimedDeleteDoc(
+            reference=self.mock_doc_ref,
+            previous_data={"status": "PROCESSED"},
+            claim_update_time=_CLAIM_UPDATE_TIME,
+        )
+        for _ in range(501)
+    ]
+
+    with self.assertLogs(job_store.__name__, level="ERROR"):
+      job_store.rollback_deleting_docs(
+          firestore_client=self.mock_firestore,
+          claimed_docs=claimed_docs,
+          bq_rows_deleted=False,
+      )
+
+    batch_chunk_1.commit.assert_called_once_with()
+    batch_chunk_2.commit.assert_called_once_with()
+    self.assertEqual(batch_chunk_2.update.call_count, 1)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="api_error",
+          error=google_exceptions.ServiceUnavailable("Rollback failed"),
+      ),
+      dict(
+          testcase_name="retry_error",
+          error=google_exceptions.RetryError(
+              "Deadline exceeded", cause=Exception("503")
+          ),
+      ),
+      dict(
+          testcase_name="auth_error",
+          error=auth_exceptions.RefreshError("Token refresh failed"),
+      ),
+  )
+  def test_rollback_deleting_docs_logs_and_suppresses_firestore_errors(
+      self, error: Exception
+  ):
+    self.mock_batch.commit.side_effect = error
+    claimed_doc = job_store.ClaimedDeleteDoc(
+        reference=self.mock_doc_ref,
+        previous_data={"status": "PROCESSED"},
+        claim_update_time=_CLAIM_UPDATE_TIME,
+    )
+
+    with self.assertLogs(job_store.__name__, level="ERROR"):
+      job_store.rollback_deleting_docs(
+          firestore_client=self.mock_firestore,
+          claimed_docs=[claimed_doc],
           bq_rows_deleted=False,
       )
 

@@ -14,13 +14,13 @@
 
 """Firestore job lifecycle state machine and optimistic concurrency helpers."""
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 import dataclasses
 import datetime
 import enum
 import hashlib
 import logging
-from typing import Any
+from typing import Any, cast
 
 from google.api_core import exceptions as google_exceptions
 from google.auth import exceptions as auth_exceptions
@@ -37,6 +37,7 @@ class JobStatus(enum.StrEnum):
   PROCESSED = "PROCESSED"
   FAILED_RETRY = "FAILED_RETRY"
   FAILED_PERMANENT = "FAILED_PERMANENT"
+  DELETING = "DELETING"
 
 
 class EnqueueOutcome(enum.StrEnum):
@@ -45,6 +46,14 @@ class EnqueueOutcome(enum.StrEnum):
   QUEUED = "queued"
   SKIPPED = "skipped"
   DEFERRED_IN_FLIGHT = "deferred_in_flight"
+
+
+class DeleteAction(enum.StrEnum):
+  """Reconciliation outcome for an incoming GCS object delete event."""
+
+  DELETE = "delete"
+  DEFER_IN_FLIGHT = "defer_in_flight"
+  SKIP_STALE_GENERATION = "skip_stale_generation"
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -60,6 +69,21 @@ class ReconcileDecision:
 
   outcome: EnqueueOutcome
   delete_superseded_rows: bool = False
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class DeletePlan:
+  """Execution plan for handling a GCS object delete CloudEvent.
+
+  Attributes:
+    action: Whether to hard-delete, defer while a job runs, or skip a stale
+      generation.
+    target_docs: Settled Firestore job document snapshots to delete when
+      `action` is `DeleteAction.DELETE`.
+  """
+
+  action: DeleteAction
+  target_docs: tuple[firestore.DocumentSnapshot, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -86,16 +110,44 @@ class ClaimedQueuedJob:
   claim_update_time: Any = None
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ClaimedDeleteDoc:
+  """Lease state for a Firestore job document marked `DELETING`.
+
+  Each `(gcs_uri, prompt_version_id)` audit job is stored as a Firestore
+  document. Marking it `DELETING` reserves a temporary lease so concurrent
+  `/ingest` or `/delete` events defer while BigQuery rows are purged.
+
+  Attributes:
+    reference: `DocumentReference` of the leased Firestore job document.
+    previous_data: Stored fields captured before transitioning to `DELETING`.
+    claim_update_time: Server `update_time` from the `DELETING` write, used as a
+      `last_update_time` precondition on commit or rollback, or `None` if
+      unavailable.
+  """
+
+  reference: firestore.DocumentReference
+  previous_data: Mapping[str, Any]
+  claim_update_time: Any = None
+
+
+_FIRESTORE_BATCH_LIMIT = 500
 _CLOUD_TASKS_MAX_ATTEMPTS = 5
 _MAX_INT64 = (1 << 63) - 1
 _MAX_INT64_DIGITS = len(str(_MAX_INT64))
 _RETRY_IN_FLIGHT_WINDOW = datetime.timedelta(minutes=10)
+_DELETING_CLAIM_WINDOW = datetime.timedelta(minutes=10)
 _MAX_IN_FLIGHT_JOB_AGE = datetime.timedelta(hours=2)
 _RETRYABLE_FAILURE_STATUSES = (
     JobStatus.FAILED_RETRY,
     JobStatus.FAILED_PERMANENT,
 )
-_STALE_RETRY_JOB_FIELDS = ("attempts", "error_message", "last_processed_at")
+_STALE_RETRY_JOB_FIELDS = (
+    "attempts",
+    "deleting_at",
+    "error_message",
+    "last_processed_at",
+)
 
 
 def make_job_doc_id(gcs_uri: str, prompt_version_id: str) -> str:
@@ -194,6 +246,20 @@ def _is_job_in_flight(
   return _is_retry_backoff_active(job_data, now=now)
 
 
+def _is_deleting_claim_active(
+    job_data: Mapping[str, Any], *, now: datetime.datetime
+) -> bool:
+  """Returns whether a job is currently claimed by an active `/delete` call."""
+  if job_data.get("status") != JobStatus.DELETING:
+    return False
+  return _is_timestamp_within_window(
+      job_data.get("deleting_at"),
+      window=_DELETING_CLAIM_WINDOW,
+      default_when_missing=True,
+      now=now,
+  )
+
+
 def _is_job_active(
     job_data: Mapping[str, Any], *, now: datetime.datetime
 ) -> bool:
@@ -229,6 +295,8 @@ def reconcile_existing_job(
   """
   reference_now = now or datetime.datetime.now(datetime.timezone.utc)
   if event_generation is None:
+    if _is_deleting_claim_active(job_data, now=reference_now):
+      return ReconcileDecision(outcome=EnqueueOutcome.DEFERRED_IN_FLIGHT)
     if _is_job_active(job_data, now=reference_now):
       return ReconcileDecision(outcome=EnqueueOutcome.SKIPPED)
     return ReconcileDecision(outcome=EnqueueOutcome.QUEUED)
@@ -246,16 +314,68 @@ def reconcile_existing_job(
     return ReconcileDecision(outcome=EnqueueOutcome.SKIPPED)
 
   if stored_generation is not None and event_generation == stored_generation:
-    if _is_job_active(job_data, now=reference_now):
+    if _is_job_active(job_data, now=reference_now) or _is_deleting_claim_active(
+        job_data, now=reference_now
+    ):
       return ReconcileDecision(outcome=EnqueueOutcome.SKIPPED)
     return ReconcileDecision(outcome=EnqueueOutcome.QUEUED)
 
-  if _is_job_in_flight(job_data, now=reference_now):
+  if _is_job_in_flight(
+      job_data, now=reference_now
+  ) or _is_deleting_claim_active(job_data, now=reference_now):
     return ReconcileDecision(outcome=EnqueueOutcome.DEFERRED_IN_FLIGHT)
 
   return ReconcileDecision(
       outcome=EnqueueOutcome.QUEUED,
       delete_superseded_rows=True,
+  )
+
+
+def classify_delete_snapshots(
+    *,
+    doc_snapshots: Iterable[firestore.DocumentSnapshot],
+    event_generation: int | None,
+    now: datetime.datetime | None = None,
+) -> DeletePlan:
+  """Classifies Firestore job snapshots for a GCS object delete event.
+
+  Args:
+    doc_snapshots: Existing Firestore job documents for the target `gcs_uri`.
+    event_generation: GCS generation from the delete event, or `None` if unset.
+    now: Optional UTC reference timestamp for staleness checks; defaults to
+      current UTC wall time.
+
+  Returns:
+    A `DeletePlan` describing whether deletion must be skipped as a retired
+    generation, deferred for an in-flight job, or applied to `target_docs`.
+  """
+  reference_now = now or datetime.datetime.now(datetime.timezone.utc)
+  has_in_flight_job = False
+  target_docs: list[firestore.DocumentSnapshot] = []
+  for doc_snapshot in doc_snapshots:
+    if not doc_snapshot.exists:
+      continue
+    job_data = doc_snapshot.to_dict() or {}
+    stored_generation = parse_generation(job_data.get("generation"))
+    is_newer_stored_generation = (
+        event_generation is not None
+        and stored_generation is not None
+        and stored_generation > event_generation
+    )
+    if is_newer_stored_generation:
+      return DeletePlan(action=DeleteAction.SKIP_STALE_GENERATION)
+    if _is_job_in_flight(
+        job_data, now=reference_now
+    ) or _is_deleting_claim_active(job_data, now=reference_now):
+      has_in_flight_job = True
+      continue
+    target_docs.append(doc_snapshot)
+
+  if has_in_flight_job:
+    return DeletePlan(action=DeleteAction.DEFER_IN_FLIGHT)
+  return DeletePlan(
+      action=DeleteAction.DELETE,
+      target_docs=tuple(target_docs),
   )
 
 
@@ -286,6 +406,38 @@ def _delete_doc(
     doc_ref.delete(option=option)
     return
   doc_ref.delete()
+
+
+def _batch_update_doc(
+    *,
+    firestore_client: firestore.Client,
+    batch: firestore.WriteBatch,
+    doc_ref: firestore.DocumentReference,
+    field_updates: Mapping[str, Any],
+    last_update_time: Any,
+) -> None:
+  """Stages a batch update on `doc_ref` with an optional write precondition."""
+  updates = dict(field_updates)
+  if last_update_time is not None:
+    option = firestore_client.write_option(last_update_time=last_update_time)
+    batch.update(doc_ref, updates, option=option)
+    return
+  batch.update(doc_ref, updates)
+
+
+def _batch_delete_doc(
+    *,
+    firestore_client: firestore.Client,
+    batch: firestore.WriteBatch,
+    doc_ref: firestore.DocumentReference,
+    last_update_time: Any,
+) -> None:
+  """Stages a batch delete on `doc_ref` with an optional write precondition."""
+  if last_update_time is not None:
+    option = firestore_client.write_option(last_update_time=last_update_time)
+    batch.delete(doc_ref, option=option)
+    return
+  batch.delete(doc_ref)
 
 
 def claim_queued_job(
@@ -400,3 +552,173 @@ def rollback_claimed_job(
     _LOGGER.exception(
         "Failed to roll back claimed Firestore state for %s.", doc_ref.id
     )
+
+
+def rollback_deleting_docs(
+    *,
+    firestore_client: firestore.Client,
+    claimed_docs: Sequence[ClaimedDeleteDoc],
+    bq_rows_deleted: bool,
+) -> None:
+  """Restores leased `DELETING` Firestore job documents when deletion fails.
+
+  Isolates each 500-document batch commit so a precondition mismatch or RPC
+  failure in one chunk does not skip rolling back subsequent chunks, and logs
+  errors without masking the caller's original exception.
+
+  Args:
+    firestore_client: Firestore client used to stage rollback batches.
+    claimed_docs: Lease records for Firestore job documents marked `DELETING`.
+    bq_rows_deleted: Whether BigQuery rows were already deleted before failure.
+  """
+  for start_index in range(0, len(claimed_docs), _FIRESTORE_BATCH_LIMIT):
+    chunk = claimed_docs[start_index : start_index + _FIRESTORE_BATCH_LIMIT]
+    try:
+      batch = firestore_client.batch()
+      for claimed_doc in chunk:
+        if bq_rows_deleted:
+          restore_updates: dict[str, Any] = {
+              "status": JobStatus.FAILED_RETRY,
+              "attempts": _CLOUD_TASKS_MAX_ATTEMPTS,
+              "deleting_at": firestore.DELETE_FIELD,
+          }
+        else:
+          restore_updates = {
+              "status": claimed_doc.previous_data.get(
+                  "status", firestore.DELETE_FIELD
+              ),
+              "deleting_at": claimed_doc.previous_data.get(
+                  "deleting_at", firestore.DELETE_FIELD
+              ),
+          }
+        _batch_update_doc(
+            firestore_client=firestore_client,
+            batch=batch,
+            doc_ref=claimed_doc.reference,
+            field_updates=restore_updates,
+            last_update_time=claimed_doc.claim_update_time,
+        )
+      batch.commit()
+    except (
+        auth_exceptions.GoogleAuthError,
+        google_exceptions.GoogleAPIError,
+    ):
+      _LOGGER.exception(
+          "Failed to roll back %d DELETING Firestore job claim(s).",
+          len(chunk),
+      )
+
+
+def claim_deleting_docs(
+    *,
+    firestore_client: firestore.Client,
+    target_docs: Sequence[firestore.DocumentSnapshot],
+    now: datetime.datetime | None = None,
+) -> tuple[ClaimedDeleteDoc, ...]:
+  """Marks Firestore job documents `DELETING` to reserve a deletion lease.
+
+  Updates each Firestore job document in `target_docs` with
+  `status="DELETING"` and `deleting_at` guarded by its snapshot `update_time`
+  precondition, so concurrent `/ingest` or `/delete` events defer while
+  BigQuery rows are purged. Rolls back already-committed chunks if a later
+  500-document batch chunk fails.
+
+  Args:
+    firestore_client: Firestore client used to commit batched updates.
+    target_docs: Settled Firestore `DocumentSnapshot` job records to mark
+      `DELETING`.
+    now: Optional UTC timestamp recorded as `deleting_at`; defaults to current
+      UTC wall time.
+
+  Returns:
+    `ClaimedDeleteDoc` lease records capturing each Firestore job document's
+    prior fields and new `update_time` precondition token for commit or
+    rollback.
+
+  Raises:
+    auth_exceptions.GoogleAuthError: If Firestore authentication fails.
+    google_exceptions.GoogleAPIError: If any batch precondition or commit fails.
+  """
+  claimed_docs: list[ClaimedDeleteDoc] = []
+  deleting_at = now or datetime.datetime.now(datetime.timezone.utc)
+  try:
+    for start_index in range(0, len(target_docs), _FIRESTORE_BATCH_LIMIT):
+      chunk = target_docs[start_index : start_index + _FIRESTORE_BATCH_LIMIT]
+      batch = firestore_client.batch()
+      for doc_snapshot in chunk:
+        doc_ref = cast(firestore.DocumentReference, doc_snapshot.reference)
+        _batch_update_doc(
+            firestore_client=firestore_client,
+            batch=batch,
+            doc_ref=doc_ref,
+            field_updates={
+                "status": JobStatus.DELETING,
+                "deleting_at": deleting_at,
+            },
+            last_update_time=doc_snapshot.update_time,
+        )
+      write_results = batch.commit()
+      for index, doc_snapshot in enumerate(chunk):
+        claim_update_time = None
+        if index < len(write_results):
+          claim_update_time = write_results[index].update_time
+        claimed_docs.append(
+            ClaimedDeleteDoc(
+                reference=cast(
+                    firestore.DocumentReference, doc_snapshot.reference
+                ),
+                previous_data=doc_snapshot.to_dict() or {},
+                claim_update_time=claim_update_time,
+            )
+        )
+  except Exception:
+    if claimed_docs:
+      rollback_deleting_docs(
+          firestore_client=firestore_client,
+          claimed_docs=claimed_docs,
+          bq_rows_deleted=False,
+      )
+    raise
+  return tuple(claimed_docs)
+
+
+def commit_deleted_docs(
+    *,
+    firestore_client: firestore.Client,
+    claimed_docs: Sequence[ClaimedDeleteDoc],
+    bq_rows_deleted: bool = True,
+) -> None:
+  """Deletes leased `DELETING` Firestore job documents in batches.
+
+  Rolls back any undeleted tail chunks if a batch commit fails.
+
+  Args:
+    firestore_client: Firestore client used to commit batched deletes.
+    claimed_docs: Lease records for Firestore job documents to delete.
+    bq_rows_deleted: Whether BigQuery rows were already purged prior to commit,
+      controlling rollback state for any uncommitted tail chunks.
+
+  Raises:
+    auth_exceptions.GoogleAuthError: If Firestore authentication fails.
+    google_exceptions.GoogleAPIError: If any batch precondition or commit fails.
+  """
+  for start_index in range(0, len(claimed_docs), _FIRESTORE_BATCH_LIMIT):
+    try:
+      batch = firestore_client.batch()
+      for claimed_doc in claimed_docs[
+          start_index : start_index + _FIRESTORE_BATCH_LIMIT
+      ]:
+        _batch_delete_doc(
+            firestore_client=firestore_client,
+            batch=batch,
+            doc_ref=claimed_doc.reference,
+            last_update_time=claimed_doc.claim_update_time,
+        )
+      batch.commit()
+    except Exception:
+      rollback_deleting_docs(
+          firestore_client=firestore_client,
+          claimed_docs=claimed_docs[start_index:],
+          bq_rows_deleted=bq_rows_deleted,
+      )
+      raise
