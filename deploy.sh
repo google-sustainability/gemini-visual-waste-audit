@@ -95,8 +95,68 @@ if [[ -z "${GCP_PROJECT_ID}" ]]; then
   exit 1
 fi
 
+TRIGGER_NAME="waste-audit-gcs-trigger"
+DELETE_TRIGGER_NAME="waste-audit-gcs-delete-trigger"
+
+# Inspects an Eventarc trigger and prints "PRESENT:<bucket>" when found, or
+# prints nothing when the trigger (or Eventarc API) does not exist yet. Fails
+# fast with a non-zero exit status on unexpected gcloud/auth/network errors.
+describe_trigger_bucket() {
+  local trigger_name="$1"
+  local raw_output
+  local exit_code=0
+  raw_output="$(
+    gcloud eventarc triggers describe "${trigger_name}" \
+      --location="${GCP_REGION}" \
+      --project="${GCP_PROJECT_ID}" \
+      --format="flattened(eventFilters[])" 2>&1
+  )" || exit_code=$?
+  if [[ "${exit_code}" -ne 0 ]]; then
+    if [[ "${raw_output}" == *"NOT_FOUND"* ]] \
+      || [[ "${raw_output}" == *"not found"* ]] \
+      || [[ "${raw_output}" == *"SERVICE_DISABLED"* ]] \
+      || [[ "${raw_output}" == *"has not been used in project"* ]] \
+      || [[ "${raw_output}" == *"is disabled"* ]]; then
+      return 0
+    fi
+    echo "Error describing Eventarc trigger '${trigger_name}': ${raw_output}" >&2
+    return "${exit_code}"
+  fi
+  local bucket_filter
+  bucket_filter="$(
+    awk '
+      match($0, /^eventFilters\[[0-9]+\]/) {
+        idx = substr($0, RSTART, RLENGTH)
+        val = $0
+        sub(/^[^:]+:[[:space:]]*/, "", val)
+        if ($0 ~ /\.attribute:/) attr[idx] = val
+        if ($0 ~ /\.value:/) vals[idx] = val
+      }
+      END {
+        for (i in attr) {
+          if (attr[i] == "bucket") {
+            print vals[i]
+            exit
+          }
+        }
+      }
+    ' <<< "${raw_output}"
+  )"
+  echo "PRESENT:${bucket_filter}"
+}
+
 if [[ -z "${GCS_BUCKET_NAME}" ]]; then
-  GCS_BUCKET_NAME="${GCP_PROJECT_ID}-waste-audit-images"
+  EXISTING_TRIGGER_STATE="$(describe_trigger_bucket "${TRIGGER_NAME}")"
+  EXISTING_TRIGGER_BUCKET="${EXISTING_TRIGGER_STATE#PRESENT:}"
+  if [[ -z "${EXISTING_TRIGGER_BUCKET}" ]]; then
+    EXISTING_DELETE_TRIGGER_STATE="$(describe_trigger_bucket "${DELETE_TRIGGER_NAME}")"
+    EXISTING_TRIGGER_BUCKET="${EXISTING_DELETE_TRIGGER_STATE#PRESENT:}"
+  fi
+  if [[ -n "${EXISTING_TRIGGER_BUCKET}" ]]; then
+    GCS_BUCKET_NAME="${EXISTING_TRIGGER_BUCKET}"
+  else
+    GCS_BUCKET_NAME="${GCP_PROJECT_ID}-waste-audit-images"
+  fi
 fi
 
 export GCP_PROJECT_ID
@@ -123,6 +183,7 @@ PROCESSING_SERVICE_NAME="image-processing-service"
 echo "--- Starting Full Infrastructure and Application Deployment ---"
 echo "Project: ${GCP_PROJECT_ID}"
 echo "Region: ${GCP_REGION}"
+echo "Bucket: ${GCS_BUCKET_NAME}"
 
 # --- Step 1: Enable GCP APIs ---
 echo -e "\n[1/10] Enabling required GCP APIs..."
@@ -212,6 +273,18 @@ gcloud projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
 gcloud projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
   --member="serviceAccount:${INGESTION_SA_EMAIL}" \
   --role="roles/datastore.user" \
+  --condition=None
+gcloud projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
+  --member="serviceAccount:${INGESTION_SA_EMAIL}" \
+  --role="roles/bigquery.dataEditor" \
+  --condition=None
+gcloud projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
+  --member="serviceAccount:${INGESTION_SA_EMAIL}" \
+  --role="roles/bigquery.jobUser" \
+  --condition=None
+gcloud projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
+  --member="serviceAccount:${INGESTION_SA_EMAIL}" \
+  --role="roles/storage.objectViewer" \
   --condition=None
 gcloud projects add-iam-policy-binding "${GCP_PROJECT_ID}" \
   --member="serviceAccount:${INGESTION_SA_EMAIL}" \
@@ -387,6 +460,8 @@ gcloud run deploy "${INGESTION_SERVICE_NAME}" \
   --set-env-vars "FIRESTORE_COLLECTION=${FIRESTORE_COLLECTION}" \
   --set-env-vars "INGESTION_SA_EMAIL=${INGESTION_SA_EMAIL}" \
   --set-env-vars "SPREADSHEET_ID=${SPREADSHEET_ID}" \
+  --set-env-vars "BIGQUERY_DATASET=${BIGQUERY_DATASET}" \
+  --set-env-vars "BIGQUERY_TABLE=${BIGQUERY_MATERIALS_TABLE}" \
   --project="${GCP_PROJECT_ID}" \
   --quiet
 
@@ -399,8 +474,6 @@ echo "Ingestion Service deployed: ${INGESTION_SERVICE_URL}"
 # --- Step 9: Create Eventarc Trigger ---
 echo -e "\n[9/10] Creating Eventarc Trigger..."
 
-TRIGGER_NAME="waste-audit-gcs-trigger"
-
 # Ensure bucket exists (Optional, you might want to create it if not exists)
 if ! gcloud storage buckets describe "gs://${GCS_BUCKET_NAME}" --project="${GCP_PROJECT_ID}" >/dev/null 2>&1;
 then
@@ -408,33 +481,60 @@ then
     gcloud storage buckets create "gs://${GCS_BUCKET_NAME}" --location="${GCP_REGION}" --project="${GCP_PROJECT_ID}"
 fi
 
-if ! gcloud eventarc triggers describe "${TRIGGER_NAME}" --location="${GCP_REGION}" --project="${GCP_PROJECT_ID}" >/dev/null 2>&1;
-then
-    echo "Creating Eventarc trigger '${TRIGGER_NAME}'..."
-    for i in {1..6}; do
-        if gcloud eventarc triggers create "${TRIGGER_NAME}" \
-            --location="${GCP_REGION}" \
-            --destination-run-service="${INGESTION_SERVICE_NAME}" \
-            --destination-run-region="${GCP_REGION}" \
-            --destination-run-path="/ingest" \
-            --event-filters="type=google.cloud.storage.object.v1.finalized" \
-            --event-filters="bucket=${GCS_BUCKET_NAME}" \
-            --service-account="${INGESTION_SA_EMAIL}" \
-            --project="${GCP_PROJECT_ID}"; then
-            echo "Eventarc trigger '${TRIGGER_NAME}' created."
-            break
-        fi
-        if [[ "$i" -lt 6 ]]; then
-            echo "Attempt $i failed. Eventarc Service Agent / IAM permissions may still be propagating. Retrying in 15 seconds..."
-            sleep 15
-        else
-            echo "Failed to create Eventarc trigger after 6 attempts."
-            exit 1
-        fi
-    done
-else
-    echo "Eventarc trigger '${TRIGGER_NAME}' already exists."
-fi
+ensure_gcs_eventarc_trigger() {
+  local trigger_name="$1"
+  local destination_path="$2"
+  local event_type="$3"
+  local trigger_state
+  trigger_state="$(describe_trigger_bucket "${trigger_name}")"
+
+  if [[ -n "${trigger_state}" ]]; then
+    local existing_bucket="${trigger_state#PRESENT:}"
+    if [[ "${existing_bucket}" == "${GCS_BUCKET_NAME}" ]]; then
+      echo "Eventarc trigger '${trigger_name}' already exists for bucket '${GCS_BUCKET_NAME}'."
+      return 0
+    fi
+    echo "Eventarc trigger '${trigger_name}' targets '${existing_bucket}' instead of '${GCS_BUCKET_NAME}'. Recreating..."
+    gcloud eventarc triggers delete "${trigger_name}" \
+      --location="${GCP_REGION}" \
+      --project="${GCP_PROJECT_ID}" \
+      --quiet
+  fi
+
+  echo "Creating Eventarc trigger '${trigger_name}'..."
+  local attempt
+  for attempt in {1..6}; do
+    if gcloud eventarc triggers create "${trigger_name}" \
+      --location="${GCP_REGION}" \
+      --destination-run-service="${INGESTION_SERVICE_NAME}" \
+      --destination-run-region="${GCP_REGION}" \
+      --destination-run-path="${destination_path}" \
+      --event-filters="type=${event_type}" \
+      --event-filters="bucket=${GCS_BUCKET_NAME}" \
+      --service-account="${INGESTION_SA_EMAIL}" \
+      --project="${GCP_PROJECT_ID}"; then
+      echo "Eventarc trigger '${trigger_name}' created."
+      return 0
+    fi
+    if [[ "${attempt}" -lt 6 ]]; then
+      echo "Attempt ${attempt} failed. Eventarc Service Agent / IAM permissions may still be propagating. Retrying in 15 seconds..."
+      sleep 15
+    fi
+  done
+
+  echo "Failed to create Eventarc trigger '${trigger_name}' after 6 attempts." >&2
+  return 1
+}
+
+ensure_gcs_eventarc_trigger \
+  "${TRIGGER_NAME}" \
+  "/ingest" \
+  "google.cloud.storage.object.v1.finalized"
+
+ensure_gcs_eventarc_trigger \
+  "${DELETE_TRIGGER_NAME}" \
+  "/delete" \
+  "google.cloud.storage.object.v1.deleted"
 
 # --- Step 10: Create Cloud Scheduler Job for Signed URL Refresher ---
 echo -e "\n[10/10] Creating Cloud Scheduler Job for Signed URL Refresher (Every 5 Days)..."
