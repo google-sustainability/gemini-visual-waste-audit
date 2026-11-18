@@ -47,7 +47,12 @@ The pipeline consists of two main services: the **Ingestion Service** and the
     `FAILED_RETRY` or `FAILED_PERMANENT` in Firestore.
 9.  **State Tracking**: **Firestore** is used throughout the process to track
     the state of each `(gcs_uri, prompt_version_id)` job (`QUEUED`,
-    `PROCESSING`, `PROCESSED`, `FAILED_RETRY`, `FAILED_PERMANENT`).
+    `PROCESSING`, `PROCESSED`, `FAILED_RETRY`, `FAILED_PERMANENT`, `DELETING`).
+10. **Object Deletion**: When an image is deleted from GCS, an Eventarc trigger
+    notifies `/delete` on the **Ingestion Service**, which defers (`503`) if any
+    job is still in flight, skips retired generations if a newer live object
+    exists, purges all **BigQuery** rows for `gcs_uri`, and deletes settled
+    **Firestore** job documents so re-uploads run as fresh uploads.
 
 ## Directory Structure
 

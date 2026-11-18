@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Behavioral tests for `main.py` loaded via `importlib` with Flask stubbed."""
+"""Behavioral tests for ingestion and hard-delete routes via `importlib`."""
 
 from collections.abc import Mapping
 import datetime
@@ -29,6 +29,7 @@ from google.api_core import exceptions as google_exceptions
 from google.auth import exceptions as auth_exceptions
 from google.cloud import bigquery
 from google.cloud import firestore
+from google.cloud import storage
 from google.cloud import tasks_v2
 
 from ingestion_service import bigquery_reconciler
@@ -149,6 +150,12 @@ class IngestionMainTest(parameterized.TestCase):
     self.mock_bq = mock.create_autospec(
         bigquery.Client, instance=True, spec_set=True
     )
+    self.mock_storage = mock.create_autospec(
+        storage.Client, instance=True, spec_set=True
+    )
+    self.mock_bucket = mock.create_autospec(
+        storage.Bucket, instance=True, spec_set=True
+    )
     self.mock_collection = mock.create_autospec(
         firestore.CollectionReference, instance=True, spec_set=True
     )
@@ -160,17 +167,28 @@ class IngestionMainTest(parameterized.TestCase):
     self.mock_query_job = mock.create_autospec(
         bigquery.QueryJob, instance=True, spec_set=True
     )
+    self.mock_query = mock.create_autospec(
+        firestore.Query, instance=True, spec_set=True
+    )
+    self.mock_batch = mock.create_autospec(
+        firestore.WriteBatch, instance=True, spec_set=True
+    )
     write_result = firestore.types.WriteResult(update_time=_CLAIM_UPDATE_TIME)
 
     self.mock_firestore.collection.return_value = self.mock_collection
     self.mock_firestore.write_option.side_effect = firestore.Client.write_option
+    self.mock_firestore.batch.return_value = self.mock_batch
+    self.mock_batch.commit.return_value = [write_result]
     self.mock_collection.document.return_value = self.mock_doc_ref
+    self.mock_collection.where.return_value = self.mock_query
     self.mock_doc_ref.get.return_value = self.mock_snapshot
     self.mock_doc_ref.create.return_value = write_result
     self.mock_doc_ref.update.return_value = write_result
     self.mock_tasks.queue_path.return_value = _QUEUE_PATH
     self.mock_bq.query.return_value = self.mock_query_job
     self.mock_query_job.num_dml_affected_rows = 0
+    self.mock_storage.bucket.return_value = self.mock_bucket
+    self.mock_bucket.get_blob.return_value = None
 
     for attribute_name, patched_value in (
         ("GCP_PROJECT_ID", _PROJECT_ID),
@@ -185,6 +203,7 @@ class IngestionMainTest(parameterized.TestCase):
         ("_FIRESTORE_CLIENT", self.mock_firestore),
         ("_TASKS_CLIENT", self.mock_tasks),
         ("_BQ_CLIENT", self.mock_bq),
+        ("_STORAGE_CLIENT", self.mock_storage),
     ):
       self.enter_context(mock.patch.object(main, attribute_name, patched_value))
     self.enter_context(
@@ -475,17 +494,26 @@ class IngestionMainTest(parameterized.TestCase):
         "prompt_version_id": "v1",
     })
 
-  def test_ingest_event_defers_when_prior_generation_is_in_flight(self):
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="processing_in_flight",
+          job_data={"status": "PROCESSING", "generation": 100},
+      ),
+      dict(
+          testcase_name="deleting_claim_active",
+          job_data={"status": "DELETING", "generation": 100},
+      ),
+  )
+  def test_ingest_event_defers_when_prior_generation_is_in_flight(
+      self, job_data: Mapping[str, Any]
+  ):
     self.mock_request.get_json.return_value = {
         "bucket": "audit-bucket",
         "name": "sample.jpg",
         "generation": "200",
     }
     self.mock_snapshot.exists = True
-    self.mock_snapshot.to_dict.return_value = {
-        "status": "PROCESSING",
-        "generation": 100,
-    }
+    self.mock_snapshot.to_dict.return_value = dict(job_data)
 
     response, status = main.ingest_event()
 
@@ -1018,6 +1046,488 @@ class IngestionMainTest(parameterized.TestCase):
     self.mock_bq.query.assert_not_called()
     self.mock_tasks.create_task.assert_not_called()
     self.mock_doc_ref.update.assert_not_called()
+
+  def test_delete_event_hard_deletes_bigquery_rows_and_firestore_jobs(self):
+    call_order: list[str] = []
+    write_result = firestore.types.WriteResult(update_time=_CLAIM_UPDATE_TIME)
+    self.mock_batch.update.side_effect = lambda *_a, **_kw: (
+        call_order.append("claim_deleting")
+    )
+    self.mock_bq.query.side_effect = lambda *_a, **_kw: (
+        call_order.append("bq_delete") or self.mock_query_job
+    )
+    self.mock_batch.delete.side_effect = lambda *_a, **_kw: (
+        call_order.append("delete_doc")
+    )
+    self.mock_batch.commit.side_effect = [[write_result], []]
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {
+        "status": "PROCESSED",
+        "generation": 100,
+    }
+    self.mock_query.stream.return_value = [self.mock_snapshot]
+    self.mock_query_job.num_dml_affected_rows = 3
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.OK)
+    self.assertEqual(
+        response,
+        {"status": "deleted", "gcs_uri": _GCS_URI, "jobs_deleted": 1},
+    )
+    self.assertEqual(call_order, ["claim_deleting", "bq_delete", "delete_doc"])
+    self.assertEqual(self.mock_storage.bucket.call_count, 2)
+    self.mock_bucket.get_blob.assert_has_calls(
+        [mock.call("sample.jpg"), mock.call("sample.jpg")]
+    )
+    self.mock_collection.where.assert_called_once()
+    where_filter = self.mock_collection.where.call_args.kwargs["filter"]
+    self.assertEqual(
+        (where_filter.field_path, where_filter.op_string, where_filter.value),
+        ("gcs_uri", "==", _GCS_URI),
+    )
+    delete_sql = self.mock_bq.query.call_args.args[0]
+    self.assertEqual(
+        delete_sql,
+        f"DELETE FROM `{_QUALIFIED_TABLE_ID}`\nWHERE\n  gcs_uri = @gcs_uri;",
+    )
+    self._assert_bq_query_parameters({"gcs_uri": _GCS_URI})
+    self.mock_batch.update.assert_called_once_with(
+        self.mock_doc_ref,
+        {"status": "DELETING", "deleting_at": mock.ANY},
+        option=firestore.Client.write_option(
+            last_update_time=_SNAPSHOT_UPDATE_TIME
+        ),
+    )
+    self.mock_batch.delete.assert_called_once_with(
+        self.mock_doc_ref,
+        option=firestore.Client.write_option(
+            last_update_time=_CLAIM_UPDATE_TIME
+        ),
+    )
+    self.assertEqual(self.mock_batch.commit.call_count, 2)
+
+  def test_delete_event_deletes_bigquery_rows_when_no_firestore_jobs_exist(
+      self,
+  ):
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+    }
+    self.mock_query.stream.return_value = []
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.OK)
+    self.assertEqual(
+        response,
+        {"status": "deleted", "gcs_uri": _GCS_URI, "jobs_deleted": 0},
+    )
+    self.mock_storage.bucket.assert_not_called()
+    self.mock_bq.query.assert_called_once()
+    self.mock_firestore.batch.assert_not_called()
+
+  def test_delete_event_skips_bigquery_dml_when_table_unconfigured(self):
+    self.enter_context(mock.patch.object(main, "BIGQUERY_TABLE", None))
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+    }
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {"status": "PROCESSED"}
+    self.mock_query.stream.return_value = [self.mock_snapshot]
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.OK)
+    self.assertEqual(
+        response,
+        {"status": "deleted", "gcs_uri": _GCS_URI, "jobs_deleted": 1},
+    )
+    self.mock_bq.query.assert_not_called()
+    self.assertEqual(self.mock_batch.commit.call_count, 2)
+
+  @parameterized.named_parameters(
+      dict(testcase_name="same_generation", live_generation=100),
+      dict(testcase_name="older_generation", live_generation=99),
+      dict(testcase_name="missing_generation", live_generation=None),
+  )
+  def test_delete_event_proceeds_when_live_blob_generation_is_not_newer(
+      self, live_generation: int | None
+  ):
+    live_blob = mock.create_autospec(storage.Blob, instance=True, spec_set=True)
+    live_blob.generation = live_generation
+    self.mock_bucket.get_blob.return_value = live_blob
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {
+        "status": "PROCESSED",
+        "generation": 100,
+    }
+    self.mock_query.stream.return_value = [self.mock_snapshot]
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.OK)
+    self.assertEqual(
+        response,
+        {"status": "deleted", "gcs_uri": _GCS_URI, "jobs_deleted": 1},
+    )
+    self.mock_bq.query.assert_called_once()
+
+  @parameterized.named_parameters(
+      dict(testcase_name="empty_firestore", has_settled_job=False),
+      dict(testcase_name="settled_firestore_job", has_settled_job=True),
+  )
+  def test_delete_event_skips_when_newer_live_blob_appears_before_dml(
+      self, has_settled_job: bool
+  ):
+    live_blob = mock.create_autospec(storage.Blob, instance=True, spec_set=True)
+    live_blob.generation = 200
+    self.mock_bucket.get_blob.side_effect = [None, live_blob]
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {
+        "status": "PROCESSED",
+        "generation": 100,
+    }
+    self.mock_query.stream.return_value = (
+        [self.mock_snapshot] if has_settled_job else []
+    )
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.OK)
+    self.assertEqual(
+        response,
+        {
+            "status": "skipped_stale_generation",
+            "gcs_uri": _GCS_URI,
+            "jobs_deleted": 0,
+        },
+    )
+    self.assertEqual(self.mock_bucket.get_blob.call_count, 2)
+    self.mock_bq.query.assert_not_called()
+    self.mock_batch.delete.assert_not_called()
+    expected_commits = 2 if has_settled_job else 0
+    self.assertEqual(self.mock_batch.commit.call_count, expected_commits)
+
+  def test_delete_event_skips_stale_generation_when_newer_live_blob_exists(
+      self,
+  ):
+    live_blob = mock.create_autospec(storage.Blob, instance=True, spec_set=True)
+    live_blob.generation = 200
+    self.mock_bucket.get_blob.return_value = live_blob
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.OK)
+    self.assertEqual(
+        response,
+        {
+            "status": "skipped_stale_generation",
+            "gcs_uri": _GCS_URI,
+            "jobs_deleted": 0,
+        },
+    )
+    self.mock_collection.where.assert_not_called()
+    self.mock_bq.query.assert_not_called()
+    self.mock_batch.commit.assert_not_called()
+
+  def test_delete_event_skips_stale_generation_after_overwrite_in_firestore(
+      self,
+  ):
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {
+        "status": "PROCESSED",
+        "generation": 200,
+    }
+    self.mock_query.stream.return_value = [self.mock_snapshot]
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.OK)
+    self.assertEqual(
+        response,
+        {
+            "status": "skipped_stale_generation",
+            "gcs_uri": _GCS_URI,
+            "jobs_deleted": 0,
+        },
+    )
+    self.mock_bq.query.assert_not_called()
+    self.mock_batch.commit.assert_not_called()
+
+  def test_delete_event_defers_when_job_is_in_flight(self):
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {
+        "status": "PROCESSING",
+        "generation": 100,
+    }
+    self.mock_query.stream.return_value = [self.mock_snapshot]
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.SERVICE_UNAVAILABLE)
+    self.assertEqual(response, "Job in progress; retry delete")
+    self.mock_bq.query.assert_not_called()
+    self.mock_batch.commit.assert_not_called()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="firestore_credentials_error",
+          client_attr="_FIRESTORE_CLIENT",
+          client_cls=(firestore, "Client"),
+      ),
+      dict(
+          testcase_name="storage_credentials_error",
+          client_attr="_STORAGE_CLIENT",
+          client_cls=(storage, "Client"),
+      ),
+  )
+  def test_delete_event_returns_internal_error_when_client_init_fails(
+      self,
+      client_attr: str,
+      client_cls: tuple[Any, str],
+  ):
+    self.enter_context(mock.patch.object(main, client_attr, None))
+    target_module, class_name = client_cls
+    self.enter_context(
+        mock.patch.object(
+            target_module,
+            class_name,
+            autospec=True,
+            spec_set=True,
+            side_effect=auth_exceptions.DefaultCredentialsError("Missing ADC"),
+        )
+    )
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.INTERNAL_SERVER_ERROR)
+    self.assertEqual(response, "Internal Server Error")
+    self.mock_bq.query.assert_not_called()
+    self.mock_batch.commit.assert_not_called()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="storage_get_blob_error",
+          failing_step="get_blob",
+          error=google_exceptions.ServiceUnavailable("GCS unavailable"),
+      ),
+      dict(
+          testcase_name="storage_retry_error",
+          failing_step="get_blob",
+          error=google_exceptions.RetryError(
+              "Deadline exceeded", cause=Exception("503")
+          ),
+      ),
+      dict(
+          testcase_name="firestore_stream_error",
+          failing_step="stream",
+          error=google_exceptions.ServiceUnavailable("Firestore unavailable"),
+      ),
+      dict(
+          testcase_name="claim_precondition_error",
+          failing_step="claim_commit",
+          error=google_exceptions.FailedPrecondition("Concurrent overwrite"),
+      ),
+  )
+  def test_delete_event_aborts_before_bq_dml_on_precommit_or_claim_failure(
+      self, failing_step: str, error: Exception
+  ):
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {
+        "status": "PROCESSED",
+        "generation": 100,
+    }
+    self.mock_query.stream.return_value = [self.mock_snapshot]
+    rpc_mocks = {
+        "get_blob": self.mock_bucket.get_blob,
+        "stream": self.mock_query.stream,
+        "claim_commit": self.mock_batch.commit,
+    }
+    rpc_mocks[failing_step].side_effect = error
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.INTERNAL_SERVER_ERROR)
+    self.assertEqual(response, "Internal Server Error")
+    self.mock_bq.query.assert_not_called()
+    self.mock_batch.delete.assert_not_called()
+
+  def test_delete_event_rolls_back_deleting_claim_when_bq_dml_fails(self):
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {
+        "status": "PROCESSED",
+        "generation": 100,
+    }
+    self.mock_query.stream.return_value = [self.mock_snapshot]
+    self.mock_bq.query.side_effect = google_exceptions.InternalServerError(
+        "BigQuery DML failure"
+    )
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.INTERNAL_SERVER_ERROR)
+    self.assertEqual(response, "Internal Server Error")
+    self.mock_batch.delete.assert_not_called()
+    self.assertEqual(self.mock_batch.commit.call_count, 2)
+    self.assertEqual(
+        self.mock_batch.update.call_args_list[1],
+        mock.call(
+            self.mock_doc_ref,
+            {"status": "PROCESSED", "deleting_at": firestore.DELETE_FIELD},
+            option=firestore.Client.write_option(
+                last_update_time=_CLAIM_UPDATE_TIME
+            ),
+        ),
+    )
+
+  def test_delete_event_marks_failed_retry_when_delete_commit_fails(self):
+    write_result = firestore.types.WriteResult(update_time=_CLAIM_UPDATE_TIME)
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {
+        "status": "PROCESSED",
+        "generation": 100,
+    }
+    self.mock_query.stream.return_value = [self.mock_snapshot]
+    self.mock_batch.commit.side_effect = [
+        [write_result],
+        google_exceptions.ServiceUnavailable("Firestore unavailable"),
+        [],
+    ]
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+        "generation": "100",
+    }
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.INTERNAL_SERVER_ERROR)
+    self.assertEqual(response, "Internal Server Error")
+    self.assertEqual(self.mock_batch.commit.call_count, 3)
+    self.assertEqual(
+        self.mock_batch.update.call_args_list[1],
+        mock.call(
+            self.mock_doc_ref,
+            {
+                "status": "FAILED_RETRY",
+                "attempts": 5,
+                "deleting_at": firestore.DELETE_FIELD,
+            },
+            option=firestore.Client.write_option(
+                last_update_time=_CLAIM_UPDATE_TIME
+            ),
+        ),
+    )
+
+  def test_delete_event_returns_internal_error_when_bq_table_config_invalid(
+      self,
+  ):
+    self.enter_context(mock.patch.object(main, "BIGQUERY_TABLE", "bad`table"))
+    self.mock_snapshot.exists = True
+    self.mock_snapshot.to_dict.return_value = {"status": "PROCESSED"}
+    self.mock_query.stream.return_value = [self.mock_snapshot]
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "sample.jpg",
+    }
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.INTERNAL_SERVER_ERROR)
+    self.assertEqual(response, "Internal Server Error")
+    self.mock_bq.query.assert_not_called()
+    self.mock_batch.commit.assert_not_called()
+
+  def test_delete_event_skips_non_image_file(self):
+    self.mock_request.get_json.return_value = {
+        "bucket": "audit-bucket",
+        "name": "notes.txt",
+    }
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.OK)
+    self.assertEqual(response, "Skipped")
+    self.mock_firestore.collection.assert_not_called()
+    self.mock_bq.query.assert_not_called()
+
+  @parameterized.named_parameters(
+      dict(testcase_name="missing_json", payload=None),
+      dict(testcase_name="non_dict_json", payload=42),
+      dict(testcase_name="missing_name", payload={"bucket": "audit-bucket"}),
+      dict(
+          testcase_name="padded_whitespace_bucket",
+          payload={"bucket": " audit-bucket ", "name": "sample.jpg"},
+      ),
+      dict(
+          testcase_name="non_alnum_boundary_bucket",
+          payload={"bucket": "-audit-bucket", "name": "sample.jpg"},
+      ),
+      dict(
+          testcase_name="bool_generation",
+          payload={
+              "bucket": "audit-bucket",
+              "name": "sample.jpg",
+              "generation": True,
+          },
+      ),
+  )
+  def test_delete_event_rejects_invalid_payload(self, payload: Any):
+    self.mock_request.get_json.return_value = payload
+
+    response, status = main.delete_event()
+
+    self.assertEqual(status, http.HTTPStatus.BAD_REQUEST)
+    self.assertEqual(response, "Invalid event data")
+    self.mock_firestore.collection.assert_not_called()
+    self.mock_bq.query.assert_not_called()
 
 
 if __name__ == "__main__":

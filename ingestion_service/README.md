@@ -1,8 +1,8 @@
 # Ingestion Service
 
 This Cloud Run service acts as the Eventarc entry point for the Gemini Visual
-Waste Audit pipeline, ingesting and reconciling GCS Object Finalized (`/ingest`)
-events.
+Waste Audit pipeline, handling GCS Object Finalized (`/ingest`) and GCS Object
+Deleted (`/delete`) events.
 
 ## Workflow
 
@@ -23,11 +23,17 @@ events.
     `(gcs_uri, prompt_version_id)`—preserving rows produced by other prompt
     versions—before creating an OIDC-authenticated task in Cloud Tasks, rolling
     back the Firestore claim if BigQuery deletion or task creation fails.
+4.  **Object Deletion (`/delete`)**: `POST /delete` reserves `DELETING` leases
+    on settled Firestore job documents for `gcs_uri`, verifies no newer live GCS
+    object superseded the delete event, hard-deletes all BigQuery rows for
+    `gcs_uri` across prompt versions, and removes the Firestore job documents so
+    subsequent re-uploads run as fresh uploads (deferring `503` while any job is
+    in flight).
 
 ## Key Components
 
--   `main.py`: Flask application handling health checks (`GET /`) and Eventarc
-    ingestion requests (`POST /ingest`).
+-   `main.py`: Flask application handling health checks (`GET /`), ingestion
+    requests (`POST /ingest`), and deletion requests (`POST /delete`).
 -   `job_store.py`: Firestore job lifecycle state machine and `last_update_time`
     optimistic-concurrency claim/rollback helpers.
 -   `bigquery_reconciler.py`: Parameterized BigQuery DML helpers for deleting

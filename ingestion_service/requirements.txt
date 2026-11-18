@@ -4,6 +4,7 @@ google-cloud-firestore==2.17.1
 google-cloud-tasks==2.15.1
 google-cloud-logging
 google-cloud-bigquery
+google-cloud-storage
 google-genai
 gspread==6.1.4
 tenacity

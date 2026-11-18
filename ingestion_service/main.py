@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cloud Run service to ingest and reconcile image processing tasks.
+"""Cloud Run service to ingest, reconcile, and delete image audit tasks.
 
-Handles Eventarc GCS Object Finalized (`/ingest`) CloudEvents.
+Handles Eventarc GCS Object Finalized (`/ingest`) and GCS Object Deleted
+(`/delete`) CloudEvents.
 """
 
+from collections.abc import Sequence
 import dataclasses
 import datetime
 import http
@@ -32,6 +34,7 @@ from google.api_core import exceptions as google_exceptions
 from google.auth import exceptions as auth_exceptions
 from google.cloud import bigquery
 from google.cloud import firestore
+from google.cloud import storage
 from google.cloud import tasks_v2
 import job_store
 
@@ -72,6 +75,7 @@ _LOGGER = logging.getLogger(__name__)
 _FIRESTORE_CLIENT: firestore.Client | None = None
 _TASKS_CLIENT: tasks_v2.CloudTasksClient | None = None
 _BQ_CLIENT: bigquery.Client | None = None
+_STORAGE_CLIENT: storage.Client | None = None
 _TASK_QUEUE_PATH: str | None = None
 _CONFIG_MANAGER = ConfigManager(SPREADSHEET_ID) if SPREADSHEET_ID else None
 
@@ -96,6 +100,20 @@ class _GcsEvent:
     return f"gs://{self.bucket}/{self.name}"
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _HardDeleteResult:
+  """Outcome of executing `_apply_hard_delete`.
+
+  Attributes:
+    skipped_stale_generation: Whether deletion was aborted because a newer live
+      GCS object appeared before BigQuery DML ran.
+    bq_rows_deleted: Number of BigQuery rows deleted across prompt versions.
+  """
+
+  skipped_stale_generation: bool = False
+  bq_rows_deleted: int = 0
+
+
 def _get_firestore_client() -> firestore.Client:
   """Lazy initializes and returns the Firestore client."""
   global _FIRESTORE_CLIENT
@@ -118,6 +136,14 @@ def _get_bq_client() -> bigquery.Client:
   if _BQ_CLIENT is None:
     _BQ_CLIENT = bigquery.Client(project=GCP_PROJECT_ID)
   return _BQ_CLIENT
+
+
+def _get_storage_client() -> storage.Client:
+  """Lazy initializes and returns the Cloud Storage client."""
+  global _STORAGE_CLIENT
+  if _STORAGE_CLIENT is None:
+    _STORAGE_CLIENT = storage.Client(project=GCP_PROJECT_ID)
+  return _STORAGE_CLIENT
 
 
 def _get_task_queue_path() -> str:
@@ -357,6 +383,99 @@ def _enqueue_prompt_version_job(
   return job_store.EnqueueOutcome.QUEUED
 
 
+def _has_newer_live_gcs_object(event: _GcsEvent) -> bool:
+  """Returns whether a live GCS object with a newer generation exists."""
+  if event.generation is None:
+    return False
+  live_blob = _get_storage_client().bucket(event.bucket).get_blob(event.name)
+  if live_blob is None:
+    return False
+  live_generation = job_store.parse_generation(live_blob.generation)
+  return live_generation is not None and live_generation > event.generation
+
+
+def _skipped_stale_delete_response(
+    gcs_uri: str,
+) -> tuple[flask.Response, http.HTTPStatus]:
+  """Returns the `200 OK` JSON response for a retired-generation delete."""
+  return (
+      flask.jsonify({
+          "status": "skipped_stale_generation",
+          "gcs_uri": gcs_uri,
+          "jobs_deleted": 0,
+      }),
+      http.HTTPStatus.OK,
+  )
+
+
+def _apply_hard_delete(
+    *,
+    firestore_client: firestore.Client,
+    event: _GcsEvent,
+    target_docs: Sequence[firestore.DocumentSnapshot],
+) -> _HardDeleteResult:
+  """Claims settled jobs, deletes BigQuery rows, and removes job documents.
+
+  Args:
+    firestore_client: Firestore client used to claim and delete job documents.
+    event: Validated GCS delete event metadata.
+    target_docs: Settled Firestore job snapshots to delete.
+
+  Returns:
+    A `_HardDeleteResult` recording the number of deleted BigQuery rows or
+    whether a concurrent newer live GCS object superseded deletion.
+
+  Raises:
+    ValueError: If BigQuery table configuration identifiers are invalid.
+  """
+  table_id = bigquery_reconciler.resolve_table_id(
+      project_id=GCP_PROJECT_ID,
+      dataset_id=BIGQUERY_DATASET,
+      table_id=BIGQUERY_TABLE,
+  )
+  claimed_docs: tuple[job_store.ClaimedDeleteDoc, ...] = ()
+  if target_docs:
+    claimed_docs = job_store.claim_deleting_docs(
+        firestore_client=firestore_client,
+        target_docs=target_docs,
+    )
+
+  bq_rows_deleted = 0
+  try:
+    if (claimed_docs or table_id is not None) and _has_newer_live_gcs_object(
+        event
+    ):
+      if claimed_docs:
+        job_store.rollback_deleting_docs(
+            firestore_client=firestore_client,
+            claimed_docs=claimed_docs,
+            bq_rows_deleted=False,
+        )
+      return _HardDeleteResult(skipped_stale_generation=True)
+    if table_id is not None:
+      bq_rows_deleted = bigquery_reconciler.delete_rows(
+          _get_bq_client(),
+          table_id=table_id,
+          gcs_uri=event.gcs_uri,
+      )
+  except Exception:
+    if claimed_docs:
+      job_store.rollback_deleting_docs(
+          firestore_client=firestore_client,
+          claimed_docs=claimed_docs,
+          bq_rows_deleted=False,
+      )
+    raise
+
+  if claimed_docs:
+    job_store.commit_deleted_docs(
+        firestore_client=firestore_client,
+        claimed_docs=claimed_docs,
+        bq_rows_deleted=table_id is not None,
+    )
+  return _HardDeleteResult(bq_rows_deleted=bq_rows_deleted)
+
+
 @app.route("/", methods=["GET"])
 def health_check() -> tuple[str, http.HTTPStatus]:
   """Returns 200 OK for service health checks."""
@@ -453,6 +572,104 @@ def ingest_event() -> tuple[str | flask.Response, http.HTTPStatus]:
       flask.jsonify(
           {"status": "success", "tasks_created": tasks_created_count}
       ),
+      http.HTTPStatus.OK,
+  )
+
+
+@app.route("/delete", methods=["POST"])
+def delete_event() -> tuple[str | flask.Response, http.HTTPStatus]:
+  """Handles CloudEvents from Eventarc (GCS Object Deleted)."""
+  event_data = flask.request.get_json(silent=True)
+  event = _parse_gcs_event(event_data)
+  if event is None:
+    _LOGGER.warning("Invalid delete event payload: %r", event_data)
+    return "Invalid event data", http.HTTPStatus.BAD_REQUEST
+
+  if not _is_supported_image(event.name):
+    _LOGGER.info("Skipping delete for non-image file: %s", event.name)
+    return "Skipped", http.HTTPStatus.OK
+
+  try:
+    if _has_newer_live_gcs_object(event):
+      _LOGGER.info(
+          "Skipping stale delete for %s (generation %s); newer live object"
+          " exists.",
+          event.gcs_uri,
+          event.generation,
+      )
+      return _skipped_stale_delete_response(event.gcs_uri)
+    firestore_client = _get_firestore_client()
+    jobs_collection = firestore_client.collection(FIRESTORE_COLLECTION)
+    plan = job_store.classify_delete_snapshots(
+        doc_snapshots=jobs_collection.where(
+            filter=firestore.FieldFilter("gcs_uri", "==", event.gcs_uri)
+        ).stream(),
+        event_generation=event.generation,
+    )
+  except (
+      auth_exceptions.GoogleAuthError,
+      google_exceptions.GoogleAPIError,
+  ):
+    _LOGGER.exception(
+        "Failed to inspect GCS or Firestore state for delete event on %s",
+        event.gcs_uri,
+    )
+    return "Internal Server Error", http.HTTPStatus.INTERNAL_SERVER_ERROR
+
+  if plan.action is job_store.DeleteAction.DEFER_IN_FLIGHT:
+    _LOGGER.info(
+        "Deferring delete for %s while job is in flight.", event.gcs_uri
+    )
+    return (
+        "Job in progress; retry delete",
+        http.HTTPStatus.SERVICE_UNAVAILABLE,
+    )
+  if plan.action is job_store.DeleteAction.SKIP_STALE_GENERATION:
+    _LOGGER.info(
+        "Skipping stale delete for %s (generation %s).",
+        event.gcs_uri,
+        event.generation,
+    )
+    return _skipped_stale_delete_response(event.gcs_uri)
+
+  try:
+    delete_result = _apply_hard_delete(
+        firestore_client=firestore_client,
+        event=event,
+        target_docs=plan.target_docs,
+    )
+  except (
+      auth_exceptions.GoogleAuthError,
+      google_exceptions.GoogleAPIError,
+      ValueError,
+  ):
+    _LOGGER.exception(
+        "Failed to apply hard-delete writes for %s", event.gcs_uri
+    )
+    return "Internal Server Error", http.HTTPStatus.INTERNAL_SERVER_ERROR
+
+  if delete_result.skipped_stale_generation:
+    _LOGGER.info(
+        "Skipping stale delete for %s (generation %s); newer live object"
+        " appeared before DML.",
+        event.gcs_uri,
+        event.generation,
+    )
+    return _skipped_stale_delete_response(event.gcs_uri)
+
+  jobs_deleted = len(plan.target_docs)
+  _LOGGER.info(
+      "Hard-deleted %s (%d Firestore jobs, %d BigQuery rows deleted).",
+      event.gcs_uri,
+      jobs_deleted,
+      delete_result.bq_rows_deleted,
+  )
+  return (
+      flask.jsonify({
+          "status": "deleted",
+          "gcs_uri": event.gcs_uri,
+          "jobs_deleted": jobs_deleted,
+      }),
       http.HTTPStatus.OK,
   )
 
